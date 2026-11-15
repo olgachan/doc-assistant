@@ -1,0 +1,250 @@
+#1.1 --q Удаляем проблемные версии и ставим стабильные
+!pip uninstall peft torchao -y --quiet
+!pip install peft==0.1uiet
+!pip install accelerate==0.30.1 --quiet
+
+print("✅ Библиотеки установлены. Перезапустите runtime!")
+import os
+import re
+import pickle
+import kagglehub
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import matplotlib.pyplot as plt
+from peft import LoraConfig, get_peft_model, TaskType
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Устройство: {device}")
+
+# ========== 1. ЗАГРУЗКА ДАТАСЕТА ==========
+file_name = "train.csv"
+dataset_dir = kagglehub.dataset_download("thedevastator/new-dataset-for-text-classification-ag-news")
+full_csv_path = os.path.join(dataset_dir, file_name)
+
+try:
+    df = pd.read_csv(full_csv_path, encoding='utf-8')
+except Exception:
+    try:
+        df = pd.read_csv(full_csv_path, encoding='windows-1251')
+    except Exception:
+        df = pd.read_csv(full_csv_path, encoding='cp1251')
+
+print(f"✅ Датасет загружен: {df.shape}")
+
+text_column = 'text' if 'text' in df.columns else df.columns[0]
+label_column = 'label' if 'label' in df.columns else df.columns[-1]
+
+def clean_text(text):
+    if not isinstance(text, str):
+        return ""
+    text = text.lower()
+    text = re.sub(r'[^a-z0-9а-яё\s]', '', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+# ========== 2. ПОДГОТОВКА ДАННЫХ ==========
+new_cleaned_rows = []
+new_labels = []
+skipped_rows = 0
+
+for raw_text, raw_label in zip(df[text_column], df[label_column]):
+    cleaned = clean_text(raw_text)
+    if len(cleaned) >= 50:
+        skipped_rows += 1
+        if skipped_rows > 5000:
+            if len(new_cleaned_rows) >= 500:
+                break
+            new_cleaned_rows.append(cleaned)
+            new_labels.append(int(raw_label) - 1)
+
+df_fine_tune = pd.DataFrame({'cleaned_text': new_cleaned_rows, 'label': new_labels})
+df_fine_tune = df_fine_tune.dropna(subset=['label'])
+df_fine_tune = df_fine_tune[(df_fine_tune['label'] >= 0) & (df_fine_tune['label'] <= 3)].reset_index(drop=True)
+
+with open('vectorizer.pkl', 'rb') as f:
+    vectorizer = pickle.load(f)
+
+X_new_matrix = vectorizer.transform(df_fine_tune['cleaned_text']).toarray()
+X_new_df = pd.DataFrame(X_new_matrix, columns=vectorizer.get_feature_names_out())
+
+X_ft_train, X_ft_test, y_ft_train, y_ft_test = train_test_split(
+    X_new_df, df_fine_tune['label'], test_size=0.2, random_state=42
+)
+
+# ========== 3. DATASET И DATALOADER ==========
+class AgentTextDataset(Dataset):
+    def __init__(self, features_df, labels_series):
+        self.states = torch.tensor(features_df.values, dtype=torch.float32)
+        self.labels = torch.tensor(labels_series.values, dtype=torch.long)
+
+    def __len__(self):
+        return len(self.states)
+
+    def __getitem__(self, idx):
+        return self.states[idx], self.labels[idx]
+
+class AgentClassifierNetwork(nn.Module):
+    def __init__(self, input_dim, num_classes=4):
+        super(AgentClassifierNetwork, self).__init__()
+        self.network = nn.Sequential(
+            nn.Dropout(0.3),
+            nn.Linear(input_dim, 128),
+            nn.BatchNorm1d(128),
+            nn.LeakyReLU(0.1),
+            nn.Dropout(0.3),
+            nn.Linear(128, 32),
+            nn.BatchNorm1d(32),
+            nn.LeakyReLU(0.1),
+            nn.Dropout(0.2),
+            nn.Linear(32, num_classes)
+        )
+
+    def forward(self, x=None, **kwargs):
+        if x is None and len(kwargs) > 0:
+            x = next(iter(kwargs.values()))
+        logits = self.network(x)
+        return {"logits": logits}
+
+train_dataset = AgentTextDataset(X_ft_train, y_ft_train)
+test_dataset = AgentTextDataset(X_ft_test, y_ft_test)
+train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, drop_last=True)
+test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
+
+# ========== 4. ЗАГРУЗКА БАЗОВОЙ МОДЕЛИ ==========
+input_features_count = X_new_df.shape[1]
+base_model = AgentClassifierNetwork(input_dim=input_features_count, num_classes=4)
+
+checkpoint = torch.load('model_checkpoint.pth', map_location=device)
+base_model.load_state_dict(checkpoint['model_state_dict'])
+print("✅ Веса базовой модели загружены!")
+
+# 🔥 ИСПРАВЛЕННЫЙ ConfigStub с необходимыми атрибутами
+class ConfigStub:
+    def __init__(self):
+        self.use_return_dict = True
+        self.torchscript = False
+        self.tie_word_embeddings = False
+        self.is_encoder_decoder = False
+        self.is_decoder = False
+        self.output_hidden_states = False
+        self.output_attentions = False
+        self.return_dict = True
+        self.task_specific_params = None
+        self.architectures = None
+        self.model_type = "mlp"
+        self.hidden_size = input_features_count
+        self.num_labels = 4
+
+base_model.config = ConfigStub()
+
+# ========== 5. LORA КОНФИГ ==========
+lora_config = LoraConfig(
+    r=8,
+    lora_alpha=16,
+    lora_dropout=0.3,
+    target_modules=["network.1", "network.5", "network.9"],
+    task_type=TaskType.SEQ_CLS
+)
+
+model = get_peft_model(base_model, lora_config).to(device)
+model.print_trainable_parameters()
+
+# ========== 6. ЦИКЛ ДООБУЧЕНИЯ ==========
+optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=0.0001, weight_decay=0.001)
+criterion = nn.CrossEntropyLoss()
+
+ft_epochs = 20
+history = {'train_loss': [], 'train_acc': [], 'test_loss': [], 'test_acc': []}
+
+print("\n--- Запуск LoRA дообучения ---")
+
+for epoch in range(ft_epochs):
+    model.train()
+    running_loss = 0.0
+    correct_predictions = 0
+
+    for batch_states, batch_labels in train_loader:
+        batch_states = batch_states.to(device)
+        batch_labels = batch_labels.to(device)
+
+        optimizer.zero_grad()
+        outputs = model(batch_states)
+        logits = outputs["logits"]
+        loss = criterion(logits, batch_labels)
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item() * batch_states.size(0)
+        _, predicted = torch.max(logits, 1)
+        correct_predictions += (predicted == batch_labels).sum().item()
+
+    epoch_loss = running_loss / len(train_loader.dataset)
+    epoch_acc = (correct_predictions / len(train_loader.dataset)) * 100
+
+    model.eval()
+    val_loss = 0.0
+    val_correct = 0
+
+    with torch.no_grad():
+        for batch_states, batch_labels in test_loader:
+            batch_states = batch_states.to(device)
+            batch_labels = batch_labels.to(device)
+
+            outputs = model(batch_states)
+            logits = outputs["logits"]
+            loss = criterion(logits, batch_labels)
+
+            val_loss += loss.item() * batch_states.size(0)
+            _, predicted = torch.max(logits, 1)
+            val_correct += (predicted == batch_labels).sum().item()
+
+    val_epoch_loss = val_loss / len(test_loader.dataset)
+    val_epoch_acc = (val_correct / len(test_loader.dataset)) * 100
+
+    history['train_loss'].append(epoch_loss)
+    history['train_acc'].append(epoch_acc)
+    history['test_loss'].append(val_epoch_loss)
+    history['test_acc'].append(val_epoch_acc)
+
+    print(f"Эпоха [{epoch+1}/{ft_epochs}] | "
+          f"Train Loss: {epoch_loss:.4f}, Train Acc: {epoch_acc:.2f}% | "
+          f"Test Loss: {val_epoch_loss:.4f}, Test Acc: {val_epoch_acc:.2f}%")
+
+# ========== 7. СОХРАНЕНИЕ ЧЕКПОИНТА ==========
+checkpoint_path = 'model_lora_finetuned.pth'
+torch.save({
+    'model_state_dict': model.state_dict(),
+    'optimizer_state_dict': optimizer.state_dict(),
+    'epoch': ft_epochs
+}, checkpoint_path)
+print(f"\n✅ Чекпоинт сохранен: {checkpoint_path}")
+
+# ========== 8. ГРАФИКИ ==========
+epochs_range = range(1, ft_epochs + 1)
+plt.figure(figsize=(14, 5))
+
+plt.subplot(1, 2, 1)
+plt.plot(epochs_range, history['train_loss'], 'bo-', label='Train Loss')
+plt.plot(epochs_range, history['test_loss'], 'ro-', label='Test Loss')
+plt.title('Динамика Ошибки (Loss) после LoRA')
+plt.xlabel('Эпохи')
+plt.ylabel('Loss')
+plt.grid(True)
+plt.legend()
+
+plt.subplot(1, 2, 2)
+plt.plot(epochs_range, history['train_acc'], 'b^-', label='Train Accuracy')
+plt.plot(epochs_range, history['test_acc'], 'r^-', label='Test Accuracy')
+plt.title('Динамика Точности (Accuracy) после LoRA')
+plt.xlabel('Эпохи')
+plt.ylabel('Accuracy (%)')
+plt.grid(True)
+plt.legend()
+
+plt.tight_layout()
+plt.show()
