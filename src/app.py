@@ -2,6 +2,22 @@
 from pydantic import BaseModel
 from src.rag import build_index, rag_answer
 
+import numpy as np
+from fastapi import encoders as _encoders
+
+_orig_jsonable = _encoders.jsonable_encoder
+
+def _patched_jsonable(obj, **kwargs):
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.floating):
+        return float(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    return _orig_jsonable(obj, **kwargs)
+
+_encoders.jsonable_encoder = _patched_jsonable
+
 app = FastAPI(title="Doc Assistant")
 index_state = None
 

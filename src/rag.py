@@ -5,7 +5,8 @@ from sentence_transformers import SentenceTransformer
 import faiss
 import numpy as np
 
-DATA_DIR = r"C:\Users\user\doc-assistant\data"
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DATA_DIR = os.path.join(BASE_DIR, "data")
 
 def build_index():
     print("🔨 Строим индекс...")

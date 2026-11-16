@@ -2,5 +2,6 @@ venv/
 __pycache__/
 *.pyc
 .git/
-.pytest_cache/
-.vscode/
+.env
+models/
+test_api.py
