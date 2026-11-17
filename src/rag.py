@@ -19,20 +19,37 @@ def build_index():
     print(f"✅ Индекс построен: {len(df)} документов")
     return {'index': index, 'df': df, 'model': model}
 
-def rag_answer(index_state, question, k=3):
-    if index_state is None:
-        return "Индекс не загружен", []
-    question_embedding = index_state['model'].encode([question])
-    distances, indices = index_state['index'].search(
-        np.array(question_embedding).astype('float32'), k
-    )
-    sources = []
-    context_parts = []
-    for idx in indices[0]:
-        if idx < len(index_state['df']):
-            row = index_state['df'].iloc[idx]
-            sources.append({'text': row['cleaned_text'], 'label': row['label']})
-            context_parts.append(row['cleaned_text'])
-    context = "\n".join(context_parts)
-    answer = f"Найдено {len(sources)} документов:\n\n{context}"
-    return answer, sources
+def rag_answer(query: str, index_state: dict, k: int = 3):
+    try:
+        # 1. Векторизуем запрос
+        query_vec = index_state['model'].encode([query])
+        
+        # 2. Ищем в FAISS (приводим к float32 для надежности)
+        D, I = index_state['index'].search(query_vec.astype('float32'), k)
+        
+        # 3. Безопасно извлекаем тексты
+        df = index_state['df']
+        sources = []
+        answer_parts = []
+        
+        for idx in I[0]:
+            if idx < len(df):
+                row = df.iloc[idx]
+                
+                # ЗАЩИТА ОТ ОШИБКИ: проверяем тип данных строки
+                if isinstance(row, dict):
+                    text = str(row.get("text", row))
+                    label = row.get("label", "N/A")
+                else:
+                    # Если это pandas Series
+                    text = str(row.get("text", str(row.iloc[0]) if hasattr(row, 'iloc') else str(row)))
+                    label = str(row.get("label", "N/A"))
+                
+                sources.append({"text": text, "label": label})
+                answer_parts.append(text)
+        
+        answer = "\n\n".join(answer_parts)
+        return answer, sources
+        
+    except Exception as e:
+        return f"Ошибка при поиске: {e}", []
